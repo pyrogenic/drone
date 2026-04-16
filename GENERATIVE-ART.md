@@ -12,14 +12,6 @@ Each cell visualizes a small set of continuous 0-1 parameters as a deterministic
 
 4. For each grid cell, the PRNG decides fill/empty (threshold controlled by one param, like "density") and picks from a 3-color palette. The palette is derived from params: one controls base hue, another shifts a secondary hue, a third controls saturation. Active/highlighted state bumps luminance.
 
-## Animated overlays (non-deterministic, time-driven)
-
-On top of the static grid, layer:
-
-- A **radial gradient glow** that slowly drifts position using `sin(time)`, scaled by a "breath" param. Gives a living, pulsing feel without redrawing the grid.
-- **Shimmer pixels**: small bright dots whose visibility oscillates via `sin(time * 2 + i * offset)`. Only drawn above a param threshold.
-- **Sparkle diamonds**: rotated 45-degree squares that phase in/out, driven by a different param (in our case "chimes"). Uses `ctx.rotate(PI/4)` around each point.
-
 ## Key design properties
 
 - **Deterministic structure, animated surface** -- the grid never changes for the same params, only the overlays move
@@ -28,3 +20,7 @@ On top of the static grid, layer:
 - The **palette math is simple** (`baseHue + param * range`) but reads as intentional because the symmetric structure gives it context
 - Keep the **grid small** (5x5 generating half = 25 decisions) -- too many cells and the symmetry stops registering
 - **Canvas aspect ratio of 2:1** works well for the mirrored layout
+
+## Extensions
+
+- [Animated Overlays](GEN-ART-ANIMATED-OVERLAYS.md)
