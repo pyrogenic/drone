@@ -304,7 +304,7 @@
 <script>
 const $ = id => document.getElementById(id);
 const NUM_CELLS = 8;
-const PARAM_NAMES = ['ground', 'color', 'beat', 'glow', 'air', 'chimes'];
+const PARAM_NAMES = ['ground', 'color', 'beat', 'glow', 'air', 'sing'];
 const STORAGE_KEY = 'drone-state-v4';
 
 let ctx, running = false, paused = false;
@@ -381,7 +381,7 @@ function generateChain() {
     beat:   0.1 + Math.random() * 0.6,
     glow:   0.1 + Math.random() * 0.6,
     air:    0.1 + Math.random() * 0.6,
-    chimes: Math.random() * 0.4
+    sing:   0.1 + Math.random() * 0.5
   };
   // Each step moves every param by up to +/-0.175: neighbors are related but
   // the far end of the chain is clearly somewhere else.
@@ -474,7 +474,7 @@ function drawCellArt(canvas, params, isListening, time) {
   const c = canvas.getContext('2d');
   const w = canvas.width, h = canvas.height;
 
-  const { ground, chimes } = params;
+  const { ground, sing } = params;
   const density = params.color, shimmer = params.glow, breath = params.air, drift = params.beat;
 
   // Deterministic seed from params (quantized so similar params = similar art)
@@ -484,7 +484,7 @@ function drawCellArt(canvas, params, isListening, time) {
     + Math.round(shimmer * q) * 100000
     + Math.round(breath * q) * 1000
     + Math.round(drift * q) * 10
-    + Math.round((chimes || 0) * q));
+    + Math.round((sing || 0) * q));
   const rand = seededRand(seedVal + 1);
 
   // Background
@@ -560,10 +560,10 @@ function drawCellArt(canvas, params, isListening, time) {
     }
   }
 
-  // Chimes: small bright diamond shapes, scattered
-  const chimesVal = chimes || 0;
-  if (chimesVal > 0.1) {
-    const chimeCount = Math.floor(chimesVal * 6);
+  // Sing: small bright diamond shapes, scattered
+  const singVal = sing || 0;
+  if (singVal > 0.1) {
+    const chimeCount = Math.floor(singVal * 6);
     for (let i = 0; i < chimeCount; i++) {
       const cx = rand() * w;
       const cy = rand() * h;
@@ -673,32 +673,105 @@ function voiceWeight(v, params) {
   return gate * tilt * vary;
 }
 
-function createChime(audioCtx, dest, root, color) {
-  // Soft ping on a harmonic of the root, so it belongs to the drone.
-  const pool = color < 0.4 ? [8, 12, 16] : color < 0.75 ? [8, 10, 12, 15, 16] : [8, 10, 12, 14, 15, 16];
-  const freq = root * pool[Math.floor(Math.random() * pool.length)];
-  const osc = audioCtx.createOscillator();
-  const gain = audioCtx.createGain();
-  const pan = audioCtx.createStereoPanner();
+// Harmonics the singer may land on. color opens the same ladder the voices
+// use: open fifths and octaves first, then thirds, sevenths, the 11th.
+function overtonePool(color) {
+  const pool = [6, 8, 9, 12, 16];
+  if (color > 0.35) pool.push(5, 10, 15);
+  if (color > 0.7) pool.push(7, 14);
+  if (color > 0.9) pool.push(11, 13);
+  return pool.sort((a, b) => a - b);
+}
 
-  osc.type = 'sine';
-  osc.frequency.value = freq;
-  osc.detune.value = (Math.random() - 0.5) * 6;
-  gain.gain.value = 0;
-  pan.pan.value = (Math.random() * 2 - 1) * 0.7;
+function createSinger(root, dest, getParams) {
+  // Overtone singing: a bright tone on the root, with one harmonic at a time
+  // picked out by two narrow bandpasses that glide between them. The melody
+  // comes from inside the drone, so it is always in tune with it.
+  const n = 24;
+  const real = new Float32Array(n + 1);
+  const imag = new Float32Array(n + 1);
+  for (let k = 1; k <= n; k++) imag[k] = 1 / Math.sqrt(k);
+  const src = ctx.createOscillator();
+  src.setPeriodicWave(ctx.createPeriodicWave(real, imag));
+  src.frequency.value = root;
 
-  osc.connect(gain);
-  gain.connect(pan);
+  const bands = [0, 1].map(() => {
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = root * 8;
+    bp.Q.value = 20;
+    return bp;
+  });
+  const amp = ctx.createGain();
+  amp.gain.value = 0;
+  const pan = ctx.createStereoPanner();
+
+  src.connect(bands[0]);
+  bands[0].connect(bands[1]);
+  bands[1].connect(amp);
+  amp.connect(pan);
   pan.connect(dest);
+  src.start();
 
-  const now = audioCtx.currentTime;
-  const delay = Math.random() * 0.4;
-  const peak = 0.008 + Math.random() * 0.008;
-  osc.start(now + delay);
-  gain.gain.setValueAtTime(0, now + delay);
-  gain.gain.linearRampToValueAtTime(peak, now + delay + 0.06);
-  gain.gain.exponentialRampToValueAtTime(0.0001, now + delay + 3 + Math.random() * 2);
-  osc.stop(now + delay + 6);
+  let harmonic = 8;
+  let singing = false;
+  let notesLeft = 0;
+  let timer = null;
+  const level = p => 0.5 * Math.pow(p.sing, 0.8);
+
+  function step() {
+    if (!running) return;
+    const p = getParams();
+    const now = ctx.currentTime;
+
+    if (!p || p.sing < 0.05) {
+      amp.gain.setTargetAtTime(0, now, 1.5);
+      singing = false;
+      notesLeft = 0;
+      timer = setTimeout(step, 3000);
+      return;
+    }
+
+    if (notesLeft <= 0) {
+      if (singing) {
+        // End of a phrase: breathe. More sing, shorter rests.
+        singing = false;
+        amp.gain.setTargetAtTime(0, now, 1.5);
+        timer = setTimeout(step, (4 + Math.random() * 10) * (1.3 - p.sing) * 1000);
+        return;
+      }
+      singing = true;
+      notesLeft = 3 + Math.floor(Math.random() * 5);
+    }
+
+    // Mostly stepwise through the pool, sometimes a skip.
+    const pool = overtonePool(p.color);
+    let i = pool.reduce((best, h, j) =>
+      Math.abs(h - harmonic) < Math.abs(pool[best] - harmonic) ? j : best, 0);
+    const r = Math.random();
+    i += r < 0.35 ? -1 : r < 0.7 ? 1 : r < 0.85 ? -2 : 2;
+    if (i < 0) i = -i;
+    if (i >= pool.length) i = 2 * (pool.length - 1) - i;
+    harmonic = pool[Math.max(0, i)];
+
+    const glide = 0.2 + Math.random() * 0.5;
+    bands.forEach(bp => {
+      bp.frequency.setTargetAtTime(root * harmonic, now, glide);
+      bp.Q.setTargetAtTime(2.5 * harmonic, now, glide);
+    });
+    pan.pan.setTargetAtTime((Math.random() - 0.5) * 0.6, now, 3);
+    amp.gain.setTargetAtTime(level(p), now, 0.8);
+    notesLeft--;
+    timer = setTimeout(step, (1.5 + Math.random() * 3.5) * 1000);
+  }
+
+  return {
+    start() { timer = setTimeout(step, 2000); },
+    stop() {
+      clearTimeout(timer);
+      try { src.stop(); } catch(e) {}
+    }
+  };
 }
 
 function createBreathLayer(audioCtx, dest) {
@@ -791,6 +864,7 @@ function createEngine(root, seed) {
 
   const breaths = [createBreathLayer(ctx, bus), createBreathLayer(ctx, bus)];
   let current = null;
+  const singer = createSinger(root, bus, () => current);
   let evolveId = null;
 
   function morphTo(params, tau) {
@@ -827,19 +901,15 @@ function createEngine(root, seed) {
       n.pan.pan.setTargetAtTime(newPan, now, 5);
     });
 
-    if (current.chimes > 0.05 && Math.random() < 0.08 * current.chimes) {
-      const count = 1 + Math.floor(Math.random() * 2 * current.chimes);
-      for (let c = 0; c < count; c++) createChime(ctx, bus, root, current.color);
-    }
-
     evolveId = setTimeout(evolve, 3000 + Math.random() * 4000);
   }
 
   return {
     morphTo,
-    start(params, tau) { morphTo(params, tau); evolve(); },
+    start(params, tau) { morphTo(params, tau); evolve(); singer.start(); },
     destroy() {
       clearTimeout(evolveId);
+      singer.stop();
       bus.gain.setTargetAtTime(0, ctx.currentTime, 0.5);
       setTimeout(() => {
         voices.forEach(v => {
@@ -1098,6 +1168,10 @@ $('startBtn').addEventListener('click', () => {
     const saved = loadState();
     if (saved) {
       variations = saved.variations;
+      // chimes became sing; carry the old value over
+      variations.forEach(v => {
+        if (v.sing === undefined) { v.sing = v.chimes || 0; delete v.chimes; }
+      });
       currentListening = saved.currentListening || 0;
       root = saved.root || null;
       voiceSeed = saved.voiceSeed || null;
