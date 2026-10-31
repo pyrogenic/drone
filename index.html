@@ -142,27 +142,47 @@
     text-transform: uppercase;
     color: #444460;
   }
-  .cell .param-bar {
-    width: 45px;
+  .cell .param-slider {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 55%;
     height: 2px;
+    margin: 0;
     background: #1a1a30;
+    outline: none;
     border-radius: 1px;
-    overflow: hidden;
   }
-  .cell .param-fill {
-    height: 100%;
+  .cell .param-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 10px; height: 10px;
+    border-radius: 50%;
     background: #444468;
-    border-radius: 1px;
-    transition: width 0.8s ease, background 0.8s ease;
+    cursor: pointer;
   }
-  .cell.listening .param-fill { background: #6666aa; }
+  .cell .param-slider::-moz-range-thumb {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    background: #444468;
+    cursor: pointer;
+    border: none;
+  }
+  .cell.listening .param-slider::-webkit-slider-thumb { background: #6666aa; }
+  .cell.listening .param-slider::-moz-range-thumb { background: #6666aa; }
   .cell canvas.cell-art {
     width: 100%;
     aspect-ratio: 2 / 1;
     border-radius: 4px;
     display: block;
   }
-  .params-view { display: flex; flex-direction: column; gap: 3px; }
+  /* Same box as the art canvas so cells keep their height across views */
+  .params-view {
+    aspect-ratio: 2 / 1;
+    min-height: 0;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-around;
+  }
   .vote-row {
     display: flex;
     justify-content: center;
@@ -356,15 +376,17 @@ function generateChain() {
   // Start from a random seed, each cell is a subtle mutation of the previous
   variations = [];
   let current = {
-    ground: 0.4 + Math.random() * 0.4,
-    color:  0.1 + Math.random() * 0.5,
-    beat:   0.1 + Math.random() * 0.4,
-    glow:   0.2 + Math.random() * 0.4,
-    air:    0.2 + Math.random() * 0.4,
+    ground: 0.2 + Math.random() * 0.6,
+    color:  0.1 + Math.random() * 0.6,
+    beat:   0.1 + Math.random() * 0.6,
+    glow:   0.1 + Math.random() * 0.6,
+    air:    0.1 + Math.random() * 0.6,
     chimes: Math.random() * 0.4
   };
+  // Each step moves every param by up to +/-0.175: neighbors are related but
+  // the far end of the chain is clearly somewhere else.
   for (let i = 0; i < NUM_CELLS; i++) {
-    current = (i === 0) ? { ...current } : mutate(current, 0.1);
+    current = (i === 0) ? { ...current } : mutate(current, 0.35);
     variations.push({ ...current });
   }
 }
@@ -394,9 +416,8 @@ function renderCells() {
           ${PARAM_NAMES.map(p => `
             <div class="param-row">
               <span class="param-label">${p}</span>
-              <div class="param-bar">
-                <div class="param-fill" style="width: ${v[p] * 100}%"></div>
-              </div>
+              <input type="range" class="param-slider" min="0" max="1" step="0.01"
+                value="${v[p]}" data-idx="${i}" data-param="${p}">
             </div>
           `).join('')}
         </div>
@@ -429,6 +450,24 @@ function seededRand(seed) {
     s = (s * 16807 + 0) % 2147483647;
     return (s - 1) / 2147483646;
   };
+}
+
+// Smooth pseudo-random field over param space: each identicon square is on or
+// off depending on a sine of a fixed random projection of the params, so
+// nearby params draw nearby pictures and the art differs only as much as the
+// sound does.
+const ART_FIELD = (() => {
+  const r = seededRand(1337);
+  const proj = () => PARAM_NAMES.map(() => (r() * 2 - 1) * 2.5);
+  return Array.from({ length: 25 }, () => ({
+    phase: r(), k: proj(), cphase: r(), ck: proj(), jitter: r()
+  }));
+})();
+
+function artField(phase, k, params) {
+  let d = phase;
+  PARAM_NAMES.forEach((p, j) => { d += k[j] * params[p]; });
+  return 0.5 + 0.5 * Math.sin(2 * Math.PI * d);
 }
 
 function drawCellArt(canvas, params, isListening, time) {
@@ -466,24 +505,24 @@ function drawCellArt(canvas, params, isListening, time) {
   // Generate left half, mirror to right
   for (let gy = 0; gy < rows; gy++) {
     for (let gx = 0; gx < halfCols; gx++) {
-      const r = rand();
+      const f = ART_FIELD[gy * halfCols + gx];
       // Density controls how many cells are filled
       const threshold = 0.3 + (1 - density) * 0.35;
-      if (r > threshold) {
+      if (artField(f.phase, f.k, params) > threshold) {
         // Pick from palette
-        const colorChoice = rand();
+        const colorChoice = artField(f.cphase, f.ck, params);
         let hue, lum, alpha;
         if (colorChoice < 0.45) {
           hue = baseHue;
-          lum = baseLum + rand() * 15;
+          lum = baseLum + f.jitter * 15;
           alpha = isListening ? 0.7 : 0.45;
         } else if (colorChoice < 0.75) {
           hue = hue2;
-          lum = baseLum - 5 + rand() * 20;
+          lum = baseLum - 5 + f.jitter * 20;
           alpha = isListening ? 0.55 : 0.35;
         } else {
           hue = hue3;
-          lum = baseLum + 5 + rand() * 10;
+          lum = baseLum + 5 + f.jitter * 10;
           alpha = isListening ? 0.5 : 0.3;
         }
 
@@ -916,7 +955,7 @@ function selectVariation(idx) {
     // Mutate from nearest neighbor toward the upvoted cell
     const toward = i < idx ? i + 1 : i - 1;
     const dist = Math.abs(i - idx);
-    variations[i] = mutate(variations[toward], 0.06 + dist * 0.03);
+    variations[i] = mutate(variations[toward], 0.15 + dist * 0.08);
   }
 
   renderCells();
@@ -939,7 +978,7 @@ function rejectVariation(idx) {
 
   // Mutate from nearest neighbor
   const neighbor = idx > 0 ? variations[idx - 1] : variations[idx + 1];
-  variations[idx] = mutate(neighbor, 0.12);
+  variations[idx] = mutate(neighbor, 0.4);
   renderCells();
   updateStickyClasses();
   saveState();
@@ -965,6 +1004,21 @@ $('grid').addEventListener('click', (e) => {
   const idx = parseInt(btn.dataset.idx);
   if (btn.dataset.action === 'up') selectVariation(idx);
   else rejectVariation(idx);
+});
+
+// Dragging a param edits that cell in place: it becomes the one playing,
+// is kept (sticky), and the engine follows the slider closely.
+$('grid').addEventListener('input', (e) => {
+  const slider = e.target.closest('.param-slider');
+  if (!slider || !running) return;
+  const idx = parseInt(slider.dataset.idx);
+  variations[idx][slider.dataset.param] = parseFloat(slider.value);
+  variations[idx].sticky = true;
+  if (currentListening !== idx) highlightSlot(idx);
+  else engine.morphTo(variations[idx], 0.4);
+  if (!paused) startCycling();
+  updateStickyClasses();
+  saveState();
 });
 
 // --- Background visualization ---
