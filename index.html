@@ -935,17 +935,33 @@ function createEngine(root, seed) {
 
 // --- Orchestration ---
 
+let unlockAudio = null;
+
 function unlockIOSAudio() {
   // iOS respects the silent switch for WebAudio unless the page is in the
   // "media playback" audio category. Playing a silent <audio> element on a
   // user gesture flips the category so our drone plays through the speaker
   // even with the ringer switch on.
-  const a = document.createElement('audio');
-  a.setAttribute('playsinline', '');
-  a.loop = true;
-  // 0.1s of silence as a WAV data URI
-  a.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
-  a.play().catch(() => {});
+  //
+  // The clip must have real length: looping a WAV with zero samples (what
+  // this used to do) makes Chrome spin at ~200% CPU, forever, even after
+  // the drone is ended. One element, half a second of silence, reused.
+  if (!unlockAudio) {
+    const rate = 8000, n = rate / 2;
+    const bytes = new ArrayBuffer(44 + n * 2); // samples stay zero: silence
+    const v = new DataView(bytes);
+    const tag = (o, str) => [...str].forEach((ch, i) => v.setUint8(o + i, ch.charCodeAt(0)));
+    tag(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); tag(8, 'WAVE');
+    tag(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true);
+    v.setUint16(22, 1, true); v.setUint32(24, rate, true);
+    v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+    tag(36, 'data'); v.setUint32(40, n * 2, true);
+    unlockAudio = document.createElement('audio');
+    unlockAudio.setAttribute('playsinline', '');
+    unlockAudio.loop = true;
+    unlockAudio.src = URL.createObjectURL(new Blob([bytes], { type: 'audio/wav' }));
+  }
+  unlockAudio.play().catch(() => {});
 }
 
 function init() {
@@ -1202,6 +1218,7 @@ $('startBtn').addEventListener('click', () => {
     clearInterval(cycleTimer);
     cancelAnimationFrame(artAnimId);
     if (engine) { engine.destroy(); engine = null; }
+    if (unlockAudio) unlockAudio.pause();
     if (ctx) { ctx.close(); ctx = null; }
   }
 });
