@@ -2,6 +2,6 @@
   "name": "drone",
   "version": "1.0.0",
   "scripts": {
-    "preview": "npx serve . -l 3000 --no-clipboard"
+    "preview": "npx serve . -l 4327 --no-clipboard"
   }
 }

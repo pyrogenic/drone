@@ -355,6 +355,14 @@ function saveState() {
   } catch(e) {}
 }
 
+// chimes became sing; carry the old value over
+function migrateVariations(vs) {
+  vs.forEach(v => {
+    if (v.sing === undefined) { v.sing = v.chimes || 0; delete v.chimes; }
+  });
+  return vs;
+}
+
 function loadState() {
   try {
     const s = JSON.parse(localStorage.getItem(STORAGE_KEY));
@@ -1170,11 +1178,7 @@ $('startBtn').addEventListener('click', () => {
     showSilentSwitchHintIfNeeded();
     const saved = loadState();
     if (saved) {
-      variations = saved.variations;
-      // chimes became sing; carry the old value over
-      variations.forEach(v => {
-        if (v.sing === undefined) { v.sing = v.chimes || 0; delete v.chimes; }
-      });
+      variations = migrateVariations(saved.variations);
       currentListening = saved.currentListening || 0;
       root = saved.root || null;
       voiceSeed = saved.voiceSeed || null;
@@ -1241,7 +1245,9 @@ $('dwellSlider').addEventListener('input', () => {
 
 $('saveBtn').addEventListener('click', () => {
   if (!running) return;
-  const data = JSON.stringify({ variations, currentListening, paused, viewMode, fadeTime, dwellTime }, null, 2);
+  const data = JSON.stringify({
+    variations, currentListening, paused, viewMode, fadeTime, dwellTime, root, voiceSeed
+  }, null, 2);
   const blob = new Blob([data], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -1263,20 +1269,21 @@ $('loadFile').addEventListener('change', (e) => {
     try {
       const s = JSON.parse(ev.target.result);
       if (!s || !s.variations || s.variations.length !== NUM_CELLS) return;
-      variations = s.variations;
+      // Files saved before the engine rewrite have no root/seed and old
+      // param names; they keep the current root and play on the new engine.
+      variations = migrateVariations(s.variations);
       currentListening = s.currentListening || 0;
+      if (s.root) root = s.root;
+      if (s.voiceSeed) voiceSeed = s.voiceSeed;
       paused = s.paused || false;
       viewMode = s.viewMode || 'art';
       fadeTime = s.fadeTime || 3;
       dwellTime = s.dwellTime || 12;
       saveState();
       if (running) {
-        for (let i = 0; i < NUM_CELLS; i++) {
-          if (slots[i]) { slots[i].destroy(); slots[i] = null; }
-        }
         buildGrid();
-        startAllSlots();
-        highlightSlot(currentListening);
+        startEngine();
+        clearInterval(cycleTimer);
         if (!paused) startCycling();
         $('pauseBtn').textContent = paused ? 'cycle' : 'pause';
         $('pauseBtn').classList.toggle('active', paused);
