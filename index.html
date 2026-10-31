@@ -142,32 +142,32 @@
     text-transform: uppercase;
     color: #444460;
   }
+  /* Looks like a 2px fill bar; the input is taller than the bar so it's
+     still easy to grab. --v is the fill, kept in sync on input. */
   .cell .param-slider {
+    --fill: #444468;
     -webkit-appearance: none;
     appearance: none;
-    width: 55%;
-    height: 2px;
+    width: 50%;
+    height: 10px;
     margin: 0;
-    background: #1a1a30;
+    background: linear-gradient(to right, var(--fill) var(--v), #1a1a30 var(--v))
+      center / 100% 2px no-repeat;
     outline: none;
-    border-radius: 1px;
+    cursor: ew-resize;
   }
+  .cell.listening .param-slider { --fill: #6666aa; }
   .cell .param-slider::-webkit-slider-thumb {
     -webkit-appearance: none;
-    width: 10px; height: 10px;
-    border-radius: 50%;
-    background: #444468;
-    cursor: pointer;
+    width: 6px; height: 10px;
+    background: transparent;
   }
   .cell .param-slider::-moz-range-thumb {
-    width: 10px; height: 10px;
-    border-radius: 50%;
-    background: #444468;
-    cursor: pointer;
+    width: 6px; height: 10px;
+    background: transparent;
     border: none;
   }
-  .cell.listening .param-slider::-webkit-slider-thumb { background: #6666aa; }
-  .cell.listening .param-slider::-moz-range-thumb { background: #6666aa; }
+  .cell .param-slider::-moz-range-track { background: transparent; }
   .cell canvas.cell-art {
     width: 100%;
     aspect-ratio: 2 / 1;
@@ -417,7 +417,7 @@ function renderCells() {
             <div class="param-row">
               <span class="param-label">${p}</span>
               <input type="range" class="param-slider" min="0" max="1" step="0.01"
-                value="${v[p]}" data-idx="${i}" data-param="${p}">
+                value="${v[p]}" data-idx="${i}" data-param="${p}" style="--v: ${v[p] * 100}%">
             </div>
           `).join('')}
         </div>
@@ -1013,6 +1013,7 @@ $('grid').addEventListener('input', (e) => {
   if (!slider || !running) return;
   const idx = parseInt(slider.dataset.idx);
   variations[idx][slider.dataset.param] = parseFloat(slider.value);
+  slider.style.setProperty('--v', `${slider.value * 100}%`);
   variations[idx].sticky = true;
   if (currentListening !== idx) highlightSlot(idx);
   else engine.morphTo(variations[idx], 0.4);
