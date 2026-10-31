@@ -235,10 +235,31 @@
     cursor: pointer;
     border: none;
   }
+  .toast {
+    position: fixed;
+    top: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 10;
+    background: rgba(20, 20, 35, 0.92);
+    border: 1px solid #333350;
+    border-radius: 6px;
+    padding: 10px 16px;
+    font-size: 10px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: #8888aa;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.8s ease;
+    white-space: nowrap;
+  }
+  .toast.visible { opacity: 1; }
 </style>
 </head>
 <body>
 <canvas id="viz"></canvas>
+<div class="toast" id="toast"></div>
 <div class="controls">
   <h1>Drone</h1>
   <button id="startBtn">begin</button>
@@ -736,8 +757,23 @@ function createSlot(params) {
 
 // --- Orchestration ---
 
+function unlockIOSAudio() {
+  // iOS respects the silent switch for WebAudio unless the page is in the
+  // "media playback" audio category. Playing a silent <audio> element on a
+  // user gesture flips the category so our drone plays through the speaker
+  // even with the ringer switch on.
+  const a = document.createElement('audio');
+  a.setAttribute('playsinline', '');
+  a.loop = true;
+  // 0.1s of silence as a WAV data URI
+  a.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
+  a.play().catch(() => {});
+}
+
 function init() {
+  unlockIOSAudio();
   ctx = new (window.AudioContext || window.webkitAudioContext)();
+  if (ctx.state === 'suspended') ctx.resume();
   noiseBuf = makeNoise(ctx);
 
   masterGain = ctx.createGain();
@@ -957,6 +993,17 @@ function startVisualization() {
 
 // --- Controls ---
 
+function showSilentSwitchHintIfNeeded() {
+  const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+  if (!isMobile) return;
+  if (localStorage.getItem('drone-silent-hint-shown')) return;
+  const t = $('toast');
+  t.textContent = 'no sound? check silent switch';
+  t.classList.add('visible');
+  setTimeout(() => t.classList.remove('visible'), 5000);
+  try { localStorage.setItem('drone-silent-hint-shown', '1'); } catch(e) {}
+}
+
 $('startBtn').addEventListener('click', () => {
   if (!running) {
     running = true;
@@ -964,6 +1011,7 @@ $('startBtn').addEventListener('click', () => {
     $('startBtn').classList.add('active');
     $('gridWrap').classList.add('visible');
     $('bottomRow').classList.add('visible');
+    showSilentSwitchHintIfNeeded();
     const saved = loadState();
     if (saved) {
       paused = saved.paused;
