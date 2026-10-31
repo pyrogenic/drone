@@ -284,34 +284,42 @@
 <script>
 const $ = id => document.getElementById(id);
 const NUM_CELLS = 8;
-const PARAM_NAMES = ['density', 'shimmer', 'breath', 'drift', 'chimes'];
-const STORAGE_KEY = 'drone-state-v3';
+const PARAM_NAMES = ['ground', 'color', 'beat', 'glow', 'air', 'chimes'];
+const STORAGE_KEY = 'drone-state-v4';
 
 let ctx, running = false, paused = false;
 let masterGain, noiseBuf;
 let viewMode = 'art'; // 'art' or 'params'
-let fadeTime = 3;   // crossfade seconds
+let fadeTime = 3;   // morph time constant, seconds
 let dwellTime = 12; // seconds per cell
 let variations = [];
 let currentListening = 0;
 let cycleTimer = null;
 let artAnimId = null;
-const slots = new Array(NUM_CELLS).fill(null);
+let engine = null;
+let root = null;     // session root, Hz — every cell is built on it
+let voiceSeed = null; // fixes each voice's pan/motion/variety for the session
 
-// Diatonic/pentatonic scale degrees rooted on concert pitches.
-// These are "safe" consonant intervals — no microtonal wolf tones.
-// Major pentatonic on D: D E F# A B across octaves
-const SCALE_FREQS = [
-  // Octave 3
-  293.66, 329.63, 369.99, 440.00, 493.88,
-  // Octave 4
-  587.33, 659.25, 739.99, 880.00, 987.77
-];
+// Low roots so the drone has a floor: A1, B1, C2, D2.
+const ROOTS = [55.00, 61.74, 65.41, 73.42];
 
-// Chime frequencies: high pentatonic, sparkly register
-const CHIME_FREQS = [
-  1174.66, 1318.51, 1479.98, 1760.00, 1975.53, // octave 6
-  2349.32, 2637.02, 2959.96                       // octave 7
+// Harmonics of the root in just intonation. cx is how far up the ladder a
+// voice sits; the color param opens the ladder from open fifths toward
+// thirds, sevenths and the 11th harmonic.
+const VOICE_BANK = [
+  { ratio: 1,    cx: 0 },    // root
+  { ratio: 3/2,  cx: 0 },    // fifth
+  { ratio: 2,    cx: 0 },    // octave
+  { ratio: 3,    cx: 0.15 }, // fifth, up an octave
+  { ratio: 4,    cx: 0.2 },  // two octaves
+  { ratio: 6,    cx: 0.3 },  // fifth, two up
+  { ratio: 5/2,  cx: 0.4 },  // major third (5/4)
+  { ratio: 5,    cx: 0.45 },
+  { ratio: 9/2,  cx: 0.55 }, // ninth (9/8)
+  { ratio: 15/4, cx: 0.7 },  // major seventh (15/8)
+  { ratio: 7/2,  cx: 0.75 }, // harmonic seventh (7/4)
+  { ratio: 7,    cx: 0.8 },
+  { ratio: 11/4, cx: 0.95 }, // 11th harmonic, between fourth and tritone
 ];
 
 // --- State persistence ---
@@ -319,7 +327,7 @@ const CHIME_FREQS = [
 function saveState() {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({
-      variations, currentListening, paused, viewMode, fadeTime, dwellTime
+      variations, currentListening, paused, viewMode, fadeTime, dwellTime, root, voiceSeed
     }));
   } catch(e) {}
 }
@@ -348,11 +356,12 @@ function generateChain() {
   // Start from a random seed, each cell is a subtle mutation of the previous
   variations = [];
   let current = {
-    density: 0.3 + Math.random() * 0.4,
-    shimmer: 0.2 + Math.random() * 0.4,
-    breath:  0.3 + Math.random() * 0.4,
-    drift:   0.1 + Math.random() * 0.4,
-    chimes:  Math.random() * 0.5
+    ground: 0.4 + Math.random() * 0.4,
+    color:  0.1 + Math.random() * 0.5,
+    beat:   0.1 + Math.random() * 0.4,
+    glow:   0.2 + Math.random() * 0.4,
+    air:    0.2 + Math.random() * 0.4,
+    chimes: Math.random() * 0.4
   };
   for (let i = 0; i < NUM_CELLS; i++) {
     current = (i === 0) ? { ...current } : mutate(current, 0.1);
@@ -426,11 +435,13 @@ function drawCellArt(canvas, params, isListening, time) {
   const c = canvas.getContext('2d');
   const w = canvas.width, h = canvas.height;
 
-  const { density, shimmer, breath, drift, chimes } = params;
+  const { ground, chimes } = params;
+  const density = params.color, shimmer = params.glow, breath = params.air, drift = params.beat;
 
   // Deterministic seed from params (quantized so similar params = similar art)
   const q = 40; // quantization level
-  const seedVal = (Math.round(density * q) * 10000000
+  const seedVal = (Math.round(ground * q) * 1000000000
+    + Math.round(density * q) * 10000000
     + Math.round(shimmer * q) * 100000
     + Math.round(breath * q) * 1000
     + Math.round(drift * q) * 10
@@ -442,7 +453,7 @@ function drawCellArt(canvas, params, isListening, time) {
   c.fillRect(0, 0, w, h);
 
   // Color palette derived from params
-  const baseHue = drift * 280 + 180; // full hue range
+  const baseHue = (1 - ground) * 280 + 180; // deep drones sit at the cool end
   const hue2 = baseHue + 30 + shimmer * 60;
   const hue3 = baseHue - 20 - breath * 40;
   const sat = 35 + shimmer * 35;
@@ -554,6 +565,10 @@ function startArtLoop() {
 }
 
 // --- Audio engine ---
+// One engine runs for the whole session. Every voice is a harmonic of a single
+// root and stays alive; a cell is just a set of targets, and moving between
+// cells glides every voice toward the new targets. Nothing is created or torn
+// down on a cell change, so transitions are morphs rather than crossfades.
 
 function makeNoise(audioCtx) {
   const len = audioCtx.sampleRate * 4;
@@ -565,68 +580,86 @@ function makeNoise(audioCtx) {
   return buf;
 }
 
-function createVoice(audioCtx, dest, freq) {
-  const osc = audioCtx.createOscillator();
-  const gain = audioCtx.createGain();
-  const pan = audioCtx.createStereoPanner();
-  const filter = audioCtx.createBiquadFilter();
-
-  // All sine for softer tone
-  osc.type = 'sine';
-  osc.frequency.value = freq;
-  gain.gain.value = 0;
-  pan.pan.value = Math.random() * 2 - 1;
-  // Gentle lowpass instead of bandpass — removes harshness
-  filter.type = 'lowpass';
-  filter.frequency.value = freq * 1.5 + 200;
-  filter.Q.value = 0.3 + Math.random() * 0.5;
-
-  osc.connect(filter);
-  filter.connect(gain);
-  gain.connect(pan);
-  pan.connect(dest);
-  osc.start();
-
-  const targetGain = 0.02 + Math.random() * 0.03;
-  gain.gain.setTargetAtTime(targetGain, audioCtx.currentTime, 4 + Math.random() * 8);
-
-  return { osc, gain, pan, filter, freq, targetGain, alive: true };
+function makeReverbIR(audioCtx, seconds) {
+  // Exponentially decaying stereo noise that darkens as it decays: a cheap
+  // stand-in for a large, soft room.
+  const rate = audioCtx.sampleRate;
+  const len = Math.floor(rate * seconds);
+  const buf = audioCtx.createBuffer(2, len, rate);
+  for (let ch = 0; ch < 2; ch++) {
+    const data = buf.getChannelData(ch);
+    let lp = 0;
+    for (let i = 0; i < len; i++) {
+      const t = i / len;
+      const k = 0.6 - 0.55 * t; // one-pole lowpass closes over the tail
+      lp += k * ((Math.random() * 2 - 1) - lp);
+      data[i] = lp * Math.pow(1 - t, 2.5) * Math.exp(-t * 3);
+    }
+  }
+  return buf;
 }
 
-function createChime(audioCtx, dest) {
-  // Wind chime: short high-register ping with fast decay
-  const freq = CHIME_FREQS[Math.floor(Math.random() * CHIME_FREQS.length)];
+function makeVoiceWave(audioCtx) {
+  // Saw-like harmonic stack; each voice's lowpass decides how much of it shows.
+  const n = 12;
+  const real = new Float32Array(n + 1);
+  const imag = new Float32Array(n + 1);
+  for (let k = 1; k <= n; k++) imag[k] = 1 / k;
+  return audioCtx.createPeriodicWave(real, imag);
+}
+
+function smooth01(x) {
+  const t = clamp01(x);
+  return t * t * (3 - 2 * t);
+}
+
+const MAX_RATIO_LOG = Math.log2(7);
+
+function voiceWeight(v, params) {
+  // color opens the just-intonation ladder: low color is root/fifth/octave,
+  // high color lets in thirds, sevenths, the 11th harmonic.
+  const gate = smooth01((params.color + 0.2 - v.cx) / 0.2);
+  // ground tilts the bank: high ground leans on the low harmonics.
+  const pos = Math.log2(v.ratio) / MAX_RATIO_LOG;
+  const center = 1 - params.ground;
+  const tilt = 0.25 + 0.75 * Math.exp(-((pos - center) ** 2) / (2 * 0.35 * 0.35));
+  // A smooth per-voice function of all params, so nearby cells sound nearby
+  // but the param space still has variety beyond the named axes.
+  let vary = 1;
+  if (v.proj) {
+    let d = v.phase;
+    PARAM_NAMES.forEach((p, j) => { d += v.proj[j] * params[p]; });
+    vary = 0.35 + 0.65 * (0.5 + 0.5 * Math.sin(2 * Math.PI * d));
+  }
+  return gate * tilt * vary;
+}
+
+function createChime(audioCtx, dest, root, color) {
+  // Soft ping on a harmonic of the root, so it belongs to the drone.
+  const pool = color < 0.4 ? [8, 12, 16] : color < 0.75 ? [8, 10, 12, 15, 16] : [8, 10, 12, 14, 15, 16];
+  const freq = root * pool[Math.floor(Math.random() * pool.length)];
   const osc = audioCtx.createOscillator();
   const gain = audioCtx.createGain();
   const pan = audioCtx.createStereoPanner();
-  const filter = audioCtx.createBiquadFilter();
 
   osc.type = 'sine';
   osc.frequency.value = freq;
-  // Slight detune for shimmer
-  osc.detune.value = (Math.random() - 0.5) * 15;
+  osc.detune.value = (Math.random() - 0.5) * 6;
   gain.gain.value = 0;
-  pan.pan.value = Math.random() * 2 - 1;
-  filter.type = 'bandpass';
-  filter.frequency.value = freq;
-  filter.Q.value = 8 + Math.random() * 8; // resonant ping
+  pan.pan.value = (Math.random() * 2 - 1) * 0.7;
 
-  osc.connect(filter);
-  filter.connect(gain);
+  osc.connect(gain);
   gain.connect(pan);
   pan.connect(dest);
 
   const now = audioCtx.currentTime;
-  const delay = Math.random() * 0.3; // slight stagger
+  const delay = Math.random() * 0.4;
+  const peak = 0.008 + Math.random() * 0.008;
   osc.start(now + delay);
-
-  // Quick attack, slow-ish decay
   gain.gain.setValueAtTime(0, now + delay);
-  gain.gain.linearRampToValueAtTime(0.02 + Math.random() * 0.015, now + delay + 0.02);
-  gain.gain.exponentialRampToValueAtTime(0.0001, now + delay + 2 + Math.random() * 2.5);
-
-  const stopTime = delay + 4;
-  osc.stop(now + stopTime);
+  gain.gain.linearRampToValueAtTime(peak, now + delay + 0.06);
+  gain.gain.exponentialRampToValueAtTime(0.0001, now + delay + 3 + Math.random() * 2);
+  osc.stop(now + delay + 6);
 }
 
 function createBreathLayer(audioCtx, dest) {
@@ -636,7 +669,7 @@ function createBreathLayer(audioCtx, dest) {
 
   const hp = audioCtx.createBiquadFilter();
   hp.type = 'highpass';
-  hp.frequency.value = 800;
+  hp.frequency.value = 600;
 
   const bp = audioCtx.createBiquadFilter();
   bp.type = 'bandpass';
@@ -656,100 +689,125 @@ function createBreathLayer(audioCtx, dest) {
   pan.connect(dest);
   src.start();
 
-  const targetGain = 0.01 + Math.random() * 0.025;
-  gain.gain.setTargetAtTime(targetGain, audioCtx.currentTime, 3 + Math.random() * 5);
-
-  return { src, hp, bp, gain, pan, targetGain, alive: true };
+  const targetGain = 0.01 + Math.random() * 0.02;
+  return { src, hp, bp, gain, pan, targetGain };
 }
 
-function pickCluster(count) {
-  // Pick from pentatonic scale — always consonant
-  const root = Math.floor(Math.random() * (SCALE_FREQS.length - 3));
-  const cluster = [];
-  for (let i = 0; i < count; i++) {
-    const idx = root + Math.floor(Math.random() * 4);
-    cluster.push(SCALE_FREQS[Math.min(idx, SCALE_FREQS.length - 1)]);
-  }
-  return cluster;
-}
+function createEngine(root, seed) {
+  const bus = ctx.createGain();
+  bus.connect(masterGain);
+  const rand = seededRand(seed);
+  const wave = makeVoiceWave(ctx);
+  const startAt = ctx.currentTime;
 
-function createSlot(params) {
-  const slotGain = ctx.createGain();
-  slotGain.gain.value = 0;
-  slotGain.connect(masterGain);
+  const voices = VOICE_BANK.map((def, i) => {
+    const freq = root * def.ratio;
+    const pos = Math.log2(def.ratio) / MAX_RATIO_LOG;
+    // Two oscillators per voice, split by the beat rate: their interference
+    // is the slow flutter drone music runs on.
+    const oscA = ctx.createOscillator();
+    const oscB = ctx.createOscillator();
+    oscA.setPeriodicWave(wave);
+    oscB.setPeriodicWave(wave);
+    oscA.frequency.value = freq;
+    oscB.frequency.value = freq;
 
-  const voices = [];
-  const breaths = [];
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.value = freq * 1.5;
+    filter.Q.value = 0.5;
 
-  const voiceCount = 2 + Math.floor(params.density * 4);
-  const freqs = pickCluster(voiceCount);
-  for (const f of freqs) voices.push(createVoice(ctx, slotGain, f));
-  for (let i = 0; i < 2; i++) breaths.push(createBreathLayer(ctx, slotGain));
+    const amp = ctx.createGain();   // morph target level
+    amp.gain.value = 0;
+    const wob = ctx.createGain();   // slow independent swell, 0.7..1.3
+    wob.gain.value = 1;
+    const lfo = ctx.createOscillator();
+    lfo.frequency.value = 0.012 + rand() * 0.05;
+    const lfoDepth = ctx.createGain();
+    lfoDepth.gain.value = 0.3;
+    lfo.connect(lfoDepth);
+    lfoDepth.connect(wob.gain);
 
+    const pan = ctx.createStereoPanner();
+    pan.pan.value = (rand() * 2 - 1) * (0.1 + 0.7 * pos);
+
+    oscA.connect(filter);
+    oscB.connect(filter);
+    filter.connect(amp);
+    amp.connect(wob);
+    wob.connect(pan);
+    pan.connect(bus);
+    oscA.start(startAt);
+    oscB.start(startAt);
+    lfo.start(startAt + rand() * 10);
+
+    // Root and fifth are the floor; they only respond to the named axes.
+    const proj = i < 2 ? null : PARAM_NAMES.map(() => (rand() * 2 - 1) * 1.2);
+    return {
+      ...def, freq, oscA, oscB, filter, amp, lfo, proj,
+      phase: rand(),
+      beatScale: 0.5 + rand(),
+    };
+  });
+
+  const breaths = [createBreathLayer(ctx, bus), createBreathLayer(ctx, bus)];
+  let current = null;
   let evolveId = null;
 
+  function morphTo(params, tau) {
+    current = params;
+    const now = ctx.currentTime;
+    const weights = voices.map(v => voiceWeight(v, params));
+    const total = weights.reduce((a, b) => a + b, 0);
+    const norm = 0.14 / Math.pow(Math.max(1, total), 0.6);
+    // beat: 0.03 Hz (barely moving) .. 2.5 Hz (audible flutter)
+    const beatHz = 0.03 * Math.pow(2.5 / 0.03, params.beat);
+    const bright = 1.2 + params.glow * params.glow * 7;
+
+    voices.forEach((v, i) => {
+      const b = beatHz * v.beatScale;
+      v.oscA.frequency.setTargetAtTime(v.freq + b / 2, now, tau);
+      v.oscB.frequency.setTargetAtTime(v.freq - b / 2, now, tau);
+      v.filter.frequency.setTargetAtTime(Math.min(12000, v.freq * bright), now, tau);
+      v.amp.gain.setTargetAtTime(weights[i] * norm, now, tau);
+    });
+    breaths.forEach(n => {
+      n.gain.gain.setTargetAtTime(n.targetGain * params.air * 1.5, now, tau);
+    });
+  }
+
   function evolve() {
-    if (!running) return;
+    if (!running || !current) return;
     const now = ctx.currentTime;
 
-    voices.forEach(v => {
-      if (!v.alive) return;
-      // Gentle drift: stay near consonant tones
-      const driftHz = params.drift * 2;
-      v.osc.frequency.setTargetAtTime(
-        v.freq + (Math.random() - 0.5) * driftHz, now, 10 + Math.random() * 15
-      );
-      const newPan = Math.max(-1, Math.min(1, v.pan.pan.value + (Math.random() - 0.5) * 0.2));
-      v.pan.pan.setTargetAtTime(newPan, now, 6);
-      // Gentle filter modulation
-      const shimFreq = v.freq * (1.2 + params.shimmer * 0.8);
-      v.filter.frequency.setTargetAtTime(shimFreq, now, 4 + Math.random() * 5);
-    });
-
     breaths.forEach(n => {
-      if (!n.alive) return;
-      n.gain.gain.setTargetAtTime(n.targetGain * params.breath, now, 5);
-      n.bp.frequency.setTargetAtTime(1000 + Math.random() * 2000, now, 8 + Math.random() * 6);
+      // Wander between high harmonics of the root so the air hums in key.
+      const h = 12 + Math.floor(Math.random() * 36);
+      n.bp.frequency.setTargetAtTime(Math.min(4000, root * h), now, 8 + Math.random() * 6);
       const newPan = Math.max(-1, Math.min(1, n.pan.pan.value + (Math.random() - 0.5) * 0.3));
       n.pan.pan.setTargetAtTime(newPan, now, 5);
     });
 
-    // Ghost melodic hint — uses scale tones, always consonant
-    if (Math.random() < 0.03 * params.shimmer) {
-      const ghostFreq = SCALE_FREQS[Math.floor(Math.random() * SCALE_FREQS.length)];
-      const ghost = createVoice(ctx, slotGain, ghostFreq);
-      ghost.gain.gain.cancelScheduledValues(now);
-      ghost.gain.gain.setValueAtTime(0, now);
-      ghost.gain.gain.setTargetAtTime(0.004, now, 4);
-      ghost.gain.gain.setTargetAtTime(0, now + 8 + Math.random() * 10, 5);
-      ghost.alive = false;
-      setTimeout(() => { try { ghost.osc.stop(); } catch(e) {} }, 30000);
-    }
-
-    // Wind chimes — occasional tinklings, 1-3 at a time
-    if (params.chimes > 0.05 && Math.random() < 0.08 * params.chimes) {
-      const count = 1 + Math.floor(Math.random() * 2 * params.chimes);
-      for (let c = 0; c < count; c++) {
-        createChime(ctx, slotGain);
-      }
+    if (current.chimes > 0.05 && Math.random() < 0.08 * current.chimes) {
+      const count = 1 + Math.floor(Math.random() * 2 * current.chimes);
+      for (let c = 0; c < count; c++) createChime(ctx, bus, root, current.color);
     }
 
     evolveId = setTimeout(evolve, 3000 + Math.random() * 4000);
   }
 
-  evolve();
-
   return {
-    slotGain, voices, breaths, params,
-    fadeIn() { slotGain.gain.setTargetAtTime(1, ctx.currentTime, fadeTime); },
-    fadeOut() { slotGain.gain.setTargetAtTime(0, ctx.currentTime, fadeTime); },
+    morphTo,
+    start(params, tau) { morphTo(params, tau); evolve(); },
     destroy() {
       clearTimeout(evolveId);
-      slotGain.gain.setTargetAtTime(0, ctx.currentTime, 0.5);
+      bus.gain.setTargetAtTime(0, ctx.currentTime, 0.5);
       setTimeout(() => {
-        voices.forEach(v => { try { v.osc.stop(); } catch(e) {} });
+        voices.forEach(v => {
+          try { v.oscA.stop(); v.oscB.stop(); v.lfo.stop(); } catch(e) {}
+        });
         breaths.forEach(b => { try { b.src.stop(); } catch(e) {} });
-        try { slotGain.disconnect(); } catch(e) {}
+        try { bus.disconnect(); } catch(e) {}
       }, 3000);
     }
   };
@@ -779,37 +837,28 @@ function init() {
   masterGain = ctx.createGain();
   masterGain.gain.value = 0.7;
 
+  // Only clear out sub-audible rumble; the root lives at 55-73 Hz.
   const masterHP = ctx.createBiquadFilter();
   masterHP.type = 'highpass';
-  masterHP.frequency.value = 180;
+  masterHP.frequency.value = 28;
 
   const reverbMix = ctx.createGain();
-  reverbMix.gain.value = 0.3;
+  reverbMix.gain.value = 0.45;
   const dryMix = ctx.createGain();
   dryMix.gain.value = 0.7;
 
-  [0.037, 0.053, 0.079, 0.113, 0.157, 0.211].forEach(t => {
-    const d = ctx.createDelay(1);
-    d.delayTime.value = t;
-    const fb = ctx.createGain();
-    fb.gain.value = 0.4 + Math.random() * 0.2;
-    const filt = ctx.createBiquadFilter();
-    filt.type = 'lowpass';
-    filt.frequency.value = 1500 + Math.random() * 1500;
-    masterGain.connect(d);
-    d.connect(filt);
-    filt.connect(fb);
-    fb.connect(d);
-    filt.connect(reverbMix);
-  });
-
+  const reverb = ctx.createConvolver();
+  reverb.buffer = makeReverbIR(ctx, 9);
+  masterGain.connect(reverb);
+  reverb.connect(reverbMix);
   masterGain.connect(dryMix);
 
+  // Gentle glue only — a drone shouldn't pump.
   const comp = ctx.createDynamicsCompressor();
-  comp.threshold.value = -24;
-  comp.ratio.value = 4;
-  comp.attack.value = 0.1;
-  comp.release.value = 0.5;
+  comp.threshold.value = -18;
+  comp.ratio.value = 2.5;
+  comp.attack.value = 0.3;
+  comp.release.value = 1.0;
 
   dryMix.connect(comp);
   reverbMix.connect(comp);
@@ -817,18 +866,19 @@ function init() {
   masterHP.connect(ctx.destination);
 
   if (variations.length !== NUM_CELLS) generateChain();
+  if (!root) root = ROOTS[Math.floor(Math.random() * ROOTS.length)];
+  if (!voiceSeed) voiceSeed = 1 + Math.floor(Math.random() * 2147483645);
   buildGrid();
-  startAllSlots();
+  startEngine();
   if (!paused) startCycling();
   startVisualization();
   startArtLoop();
 }
 
-function startAllSlots() {
-  for (let i = 0; i < NUM_CELLS; i++) {
-    if (slots[i]) slots[i].destroy();
-    slots[i] = createSlot(variations[i]);
-  }
+function startEngine() {
+  if (engine) engine.destroy();
+  engine = createEngine(root, voiceSeed);
+  engine.start(variations[currentListening], 3);
   highlightSlot(currentListening);
 }
 
@@ -836,12 +886,7 @@ function highlightSlot(idx) {
   currentListening = idx;
   const cells = document.querySelectorAll('.cell');
   cells.forEach((cell, i) => cell.classList.toggle('listening', i === idx));
-  for (let i = 0; i < NUM_CELLS; i++) {
-    if (slots[i]) {
-      if (i === idx) slots[i].fadeIn();
-      else slots[i].fadeOut();
-    }
-  }
+  if (engine) engine.morphTo(variations[idx], fadeTime);
   updateStickyClasses();
   const activeCell = cells[idx];
   if (activeCell) activeCell.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
@@ -855,7 +900,6 @@ function startCycling() {
   }, dwellTime * 1000);
 }
 
-// Upvote: keep this cell, reroll all others as a chain from it
 // Upvote: mark sticky, gently regenerate 2-3 nearest non-sticky neighbors
 function selectVariation(idx) {
   variations[idx].sticky = true;
@@ -868,10 +912,7 @@ function selectVariation(idx) {
     if (bck >= 0 && !variations[bck].sticky) toRegen.push(bck);
   }
 
-  // Tear down and regenerate only those
   for (const i of toRegen) {
-    if (slots[i]) slots[i].destroy();
-    slots[i] = null;
     // Mutate from nearest neighbor toward the upvoted cell
     const toward = i < idx ? i + 1 : i - 1;
     const dist = Math.abs(i - idx);
@@ -882,14 +923,8 @@ function selectVariation(idx) {
   updateStickyClasses();
   saveState();
 
-  setTimeout(() => {
-    if (!running) return;
-    for (const i of toRegen) {
-      slots[i] = createSlot(variations[i]);
-      if (currentListening === i) slots[i].fadeIn();
-    }
-    if (!paused) startCycling();
-  }, 1000);
+  if (toRegen.includes(currentListening)) engine.morphTo(variations[currentListening], fadeTime);
+  if (!paused) startCycling();
 }
 
 // Downvote: reroll this cell from neighbor (unless sticky — unstick first)
@@ -902,9 +937,6 @@ function rejectVariation(idx) {
     return;
   }
 
-  if (slots[idx]) slots[idx].destroy();
-  slots[idx] = null;
-
   // Mutate from nearest neighbor
   const neighbor = idx > 0 ? variations[idx - 1] : variations[idx + 1];
   variations[idx] = mutate(neighbor, 0.12);
@@ -912,14 +944,10 @@ function rejectVariation(idx) {
   updateStickyClasses();
   saveState();
 
+  if (currentListening === idx) engine.morphTo(variations[idx], fadeTime);
+
   // Reset cycle timer so user gets full listen time
   if (!paused) startCycling();
-
-  setTimeout(() => {
-    if (!running) return;
-    slots[idx] = createSlot(variations[idx]);
-    if (currentListening === idx) slots[idx].fadeIn();
-  }, 1000);
 }
 
 function updateStickyClasses() {
@@ -967,13 +995,13 @@ function startVisualization() {
     c.fillStyle = 'rgba(10, 10, 15, 0.08)';
     c.fillRect(0, 0, w, h);
 
-    const cur = variations[currentListening] || { breath: 0.5, shimmer: 0.3 };
+    const cur = variations[currentListening] || { air: 0.5, glow: 0.3 };
 
     particles.forEach(p => {
-      p.x += p.vx + (Math.random() - 0.5) * 0.2 * cur.breath;
+      p.x += p.vx + (Math.random() - 0.5) * 0.2 * cur.air;
       p.y += p.vy + (Math.random() - 0.5) * 0.15;
       p.alpha += (Math.random() - 0.5) * 0.02;
-      p.alpha = Math.max(0.02, Math.min(0.25 + cur.shimmer * 0.15, p.alpha));
+      p.alpha = Math.max(0.02, Math.min(0.25 + cur.glow * 0.15, p.alpha));
 
       if (p.x < 0) p.x = w;
       if (p.x > w) p.x = 0;
@@ -1014,6 +1042,10 @@ $('startBtn').addEventListener('click', () => {
     showSilentSwitchHintIfNeeded();
     const saved = loadState();
     if (saved) {
+      variations = saved.variations;
+      currentListening = saved.currentListening || 0;
+      root = saved.root || null;
+      voiceSeed = saved.voiceSeed || null;
       paused = saved.paused;
       viewMode = saved.viewMode || 'art';
       fadeTime = saved.fadeTime || 3;
@@ -1033,9 +1065,7 @@ $('startBtn').addEventListener('click', () => {
     $('bottomRow').classList.remove('visible');
     clearInterval(cycleTimer);
     cancelAnimationFrame(artAnimId);
-    for (let i = 0; i < NUM_CELLS; i++) {
-      if (slots[i]) { slots[i].destroy(); slots[i] = null; }
-    }
+    if (engine) { engine.destroy(); engine = null; }
     if (ctx) { ctx.close(); ctx = null; }
   }
 });
